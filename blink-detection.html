@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <meta name="theme-color" content="#111827" />
+  <title>眨眼偵測器</title>
+  <style>
+    *{box-sizing:border-box} body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0b1020;color:#fff}
+    .wrap{max-width:720px;margin:auto;padding:18px 16px 40px}.card{background:#151c30;border-radius:22px;padding:16px;box-shadow:0 12px 36px #0005}
+    h1{font-size:28px;margin:4px 0 14px}.stage{position:relative;overflow:hidden;border-radius:18px;background:#000;aspect-ratio:3/4}
+    video,canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;transform:scaleX(-1)}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px}.stat{background:#202942;padding:12px;border-radius:15px;text-align:center}
+    .big{font-size:28px;font-weight:750}.small{opacity:.75;font-size:13px;margin-top:3px}
+    .status{margin:12px 0;padding:12px;border-radius:14px;background:#202942;text-align:center;font-weight:650}
+    button{border:0;border-radius:14px;padding:14px 16px;font-size:17px;font-weight:700;width:100%;margin-top:10px}
+    #start{background:#fff;color:#111827}#reset{background:#2a3554;color:#fff}
+    label{display:block;margin-top:14px;font-size:14px;opacity:.9}input[type=range]{width:100%}
+    .note{font-size:13px;line-height:1.45;opacity:.68;margin-top:12px}
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <h1>👁️ 眨眼偵測器</h1>
+    <div class="stage"><video id="video" autoplay playsinline muted></video><canvas id="overlay"></canvas></div>
+    <div class="status" id="status">按「開始偵測」</div>
+    <div class="grid">
+      <div class="stat"><div class="big" id="count">0</div><div class="small">眨眼次數</div></div>
+      <div class="stat"><div class="big" id="eyes">—</div><div class="small">眼睛狀態</div></div>
+    </div>
+    <label>靈敏度：<span id="sensVal">0.50</span></label>
+    <input id="sens" type="range" min="0.25" max="0.75" value="0.50" step="0.01">
+    <button id="start">開始偵測</button>
+    <button id="reset">次數歸零</button>
+    <div class="note">需要 HTTPS 與相機權限。辨識在你的裝置瀏覽器內進行。若太容易誤判，把靈敏度調低；若眨眼抓不到，把它調高。</div>
+  </div>
+</div>
+
+<script type="module">
+import vision from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22-rc.20250304/+esm";
+const { FaceLandmarker, FilesetResolver, DrawingUtils } = vision;
+
+const video = document.querySelector("#video");
+const canvas = document.querySelector("#overlay");
+const ctx = canvas.getContext("2d");
+const statusEl = document.querySelector("#status");
+const countEl = document.querySelector("#count");
+const eyesEl = document.querySelector("#eyes");
+const startBtn = document.querySelector("#start");
+const resetBtn = document.querySelector("#reset");
+const sens = document.querySelector("#sens");
+const sensVal = document.querySelector("#sensVal");
+
+let landmarker, running=false, count=0, wasClosed=false, closedAt=0, lastBlink=0;
+
+sens.oninput = () => sensVal.textContent = Number(sens.value).toFixed(2);
+resetBtn.onclick = () => { count=0; countEl.textContent="0"; };
+
+async function setupModel(){
+  statusEl.textContent="正在載入臉部辨識模型…";
+  const fileset = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22-rc.20250304/wasm"
+  );
+  landmarker = await FaceLandmarker.createFromOptions(fileset,{
+    baseOptions:{
+      modelAssetPath:"https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+      delegate:"GPU"
+    },
+    outputFaceBlendshapes:true,
+    runningMode:"VIDEO",
+    numFaces:1
+  });
+}
+
+function score(categories,name){
+  return categories.find(x=>x.categoryName===name)?.score ?? 0;
+}
+
+async function start(){
+  if(running) return;
+  try{
+    startBtn.disabled=true;
+    if(!landmarker) await setupModel();
+    statusEl.textContent="正在開啟前鏡頭…";
+    const stream=await navigator.mediaDevices.getUserMedia({
+      video:{facingMode:"user",width:{ideal:720},height:{ideal:1280}},
+      audio:false
+    });
+    video.srcObject=stream;
+    await video.play();
+    running=true;
+    startBtn.textContent="偵測中";
+    statusEl.textContent="請看著鏡頭並自然眨眼";
+    requestAnimationFrame(loop);
+  }catch(e){
+    console.error(e);
+    statusEl.textContent="無法啟動：請確認 Safari 已允許相機，並用 HTTPS 網址開啟。";
+    startBtn.disabled=false;
+  }
+}
+
+function loop(){
+  if(!running) return;
+  if(video.readyState>=2){
+    canvas.width=video.videoWidth; canvas.height=video.videoHeight;
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    const result=landmarker.detectForVideo(video,performance.now());
+    const bs=result.faceBlendshapes?.[0]?.categories;
+    if(bs){
+      const L=score(bs,"eyeBlinkLeft"), R=score(bs,"eyeBlinkRight");
+      const avg=(L+R)/2;
+      const threshold=Number(sens.value);
+      const closed=avg>threshold && L>threshold*0.72 && R>threshold*0.72;
+      eyesEl.textContent=closed?"閉":"開";
+      const now=performance.now();
+
+      if(closed && !wasClosed){ closedAt=now; wasClosed=true; }
+      if(!closed && wasClosed){
+        const duration=now-closedAt;
+        if(duration>=55 && duration<=650 && now-lastBlink>250){
+          count++; countEl.textContent=count;
+          statusEl.textContent="😉 偵測到眨眼！";
+          lastBlink=now;
+          setTimeout(()=>{ if(running) statusEl.textContent="請看著鏡頭並自然眨眼"; },350);
+        }
+        wasClosed=false;
+      }
+    } else {
+      eyesEl.textContent="—";
+      statusEl.textContent="沒有偵測到臉";
+      wasClosed=false;
+    }
+  }
+  requestAnimationFrame(loop);
+}
+startBtn.onclick=start;
+</script>
+</body>
+</html>
